@@ -53,3 +53,17 @@ def circuit_code(index: int) -> str:
     if index < 1:
         raise ValidationError("CIP 回路序号必须为正整数", index=index)
     return f"CIP-{index:02d}"
+
+
+_VESSEL_PREFIXES = {"mash_tun": "MT", "boil_kettle": "BK"}
+
+
+def vessel_code(kind: str, index: int) -> str:
+    """生成糖化间容器编号，例如 ``MT-01``、``BK-02``。"""
+
+    prefix = _VESSEL_PREFIXES.get(kind)
+    if prefix is None:
+        raise ValidationError("未知的容器类型", kind=kind)
+    if index < 1:
+        raise ValidationError("容器序号必须为正整数", index=index)
+    return f"{prefix}-{index:02d}"

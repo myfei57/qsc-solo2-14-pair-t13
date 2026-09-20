@@ -11,6 +11,7 @@ from ..domain.audit import AuditLog
 from ..domain.boil import BoilKettle
 from ..domain.cip import CIPService
 from ..domain.co2 import CO2Controller
+from ..domain.equipment import EquipmentRegistry
 from ..domain.ferment import FermentTankService
 from ..domain.hop import HopSchedule
 from ..domain.mash import MashController
@@ -43,6 +44,7 @@ class ComponentRegistry:
         self.temp = TemperatureController(self.store, self.settings, self.clock)
         self.co2 = CO2Controller(self.store, self.settings, self.clock, self.alarms)
         self.cip = CIPService(self.store, self.settings, self.clock, self.alarms)
+        self.equipment = EquipmentRegistry(self.store, self.clock)
         self.tanks = FermentTankService(
             self.store, self.settings, self.clock, self.cip, self.co2, self.alarms
         )
@@ -61,6 +63,7 @@ class ComponentRegistry:
             self.co2,
             self.alarms,
             self.audit,
+            self.equipment,
         )
         self.control = ControlService(self.temp, self.co2, self.alarms, self.audit)
         self.telemetry = TelemetryService(self.temp, self.alarms, self.audit)
@@ -73,6 +76,7 @@ class ComponentRegistry:
             "brewery": None,
             "lines": 0,
             "tanks": 0,
+            "vessels": 0,
             "probes": 0,
             "recipe": None,
             "recovered": None,
@@ -82,6 +86,12 @@ class ComponentRegistry:
         if not self.namespaces.lines_for(str(brewery["id"])):
             self.namespaces.add_line(str(brewery["id"]), "一号糖化线", 120.0, 2)
             created["lines"] = 1
+        if not self.equipment.vessels_for(str(brewery["id"])):
+            lines = self.namespaces.lines_for(str(brewery["id"]))
+            for line in lines:
+                self.equipment.register_vessel(str(brewery["id"]), "mash_tun", line_id=str(line["id"]))
+                self.equipment.register_vessel(str(brewery["id"]), "boil_kettle", line_id=str(line["id"]))
+            created["vessels"] = 2 * len(lines)
         tanks = self.tanks.list_tanks(str(brewery["id"]))
         if not tanks:
             tanks = [
@@ -127,6 +137,7 @@ class ComponentRegistry:
             "batches": self.brewing.summary(),
             "mash": self.mash.summary(),
             "boil": self.boil.summary(),
+            "equipment": self.equipment.summary(),
             "ferment": self.tanks.summary(),
             "maintenance": self.maintenance.summary(),
             "control": self.control.summary(),

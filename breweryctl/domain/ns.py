@@ -39,6 +39,7 @@ class NamespaceRegistry:
             "code": clean_code,
             "location": require_text(location, field="location", max_length=120) if location else "",
             "active_batches": [],
+            "batch_counter": 0,
             "created_at": now,
             "updated_at": now,
         }
@@ -85,14 +86,20 @@ class NamespaceRegistry:
         self.get_brewery(brewery_id)
         return self.lines.find(lambda item: item.get("brewery_id") == brewery_id)
 
-    def reserve_slot(self, brewery_id: str, batch_id: str) -> dict[str, Any]:
-        """占用一个在制批次名额，超出配额时拒绝。"""
+    def reserve_slot(self, brewery_id: str, batch_id: str) -> int:
+        """占用一个在制批次名额，并原子分配批次序号。
+
+        名额检查与序号递增在同一把工厂锁内完成，两个并发开批
+        不会拿到相同的批次号；超出配额时拒绝。
+        """
 
         clean_batch = require_text(batch_id, field="batch_id", max_length=64)
+        allocated: dict[str, int] = {}
 
         def mutate(document: dict[str, Any]) -> dict[str, Any]:
             active = list(document.get("active_batches", []))
             if clean_batch in active:
+                allocated["sequence"] = int(document.get("batch_counter", 0))
                 return document
             if len(active) >= self.settings.max_active_batches:
                 raise QuotaExceededError(
@@ -101,13 +108,16 @@ class NamespaceRegistry:
                     limit=self.settings.max_active_batches,
                     active=active,
                 )
+            sequence = int(document.get("batch_counter", 0)) + 1
             active.append(clean_batch)
             document["active_batches"] = active
+            document["batch_counter"] = sequence
             document["updated_at"] = format_moment(self.clock.now())
+            allocated["sequence"] = sequence
             return document
 
         self.breweries.update(brewery_id, mutate)
-        return self.usage(brewery_id)
+        return allocated["sequence"]
 
     def release_slot(self, brewery_id: str, batch_id: str) -> dict[str, Any]:
         """释放在制批次名额。"""

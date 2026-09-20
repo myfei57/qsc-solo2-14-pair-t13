@@ -75,6 +75,88 @@ class FermentTankService:
             raise NotFoundError("发酵罐不存在", tank_id=tank_id)
         return document
 
+    def require_batch(self, tank_id: str, batch_id: str) -> dict[str, Any]:
+        """要求发酵罐当前归属于指定批次，防止跨批次操作罐体。"""
+
+        document = self.get(tank_id)
+        if document.get("batch_id") != batch_id:
+            raise ConflictError(
+                "发酵罐不属于该批次，禁止跨批次操作",
+                tank_id=tank_id,
+                tank_batch_id=document.get("batch_id"),
+                batch_id=batch_id,
+            )
+        return document
+
+    def begin_cleaning(self, tank_id: str) -> dict[str, Any]:
+        """把空罐切入清洗中状态；被批次占用的罐禁止清洗。"""
+
+        def mutate(document: dict[str, Any]) -> dict[str, Any]:
+            if document.get("stage") not in (FermentStage.IDLE.value, FermentStage.SANITIZED.value):
+                raise ConflictError(
+                    "发酵罐正被批次占用，禁止启动清洗",
+                    tank_id=tank_id,
+                    stage=document.get("stage"),
+                    batch_id=document.get("batch_id"),
+                )
+            return merge_documents(
+                document,
+                [
+                    ("stage", FermentStage.CLEANING.value),
+                    ("updated_at", format_moment(self.clock.now())),
+                ],
+            )
+
+        with self.store.locks.guard(f"tank:{tank_id}"):
+            return self.tanks.update(tank_id, mutate)
+
+    def abort_cleaning(self, tank_id: str, previous_stage: str) -> dict[str, Any]:
+        """清洗启动失败时把罐恢复到之前的状态。"""
+
+        def mutate(document: dict[str, Any]) -> dict[str, Any]:
+            if document.get("stage") != FermentStage.CLEANING.value:
+                return document
+            return merge_documents(
+                document,
+                [
+                    ("stage", previous_stage),
+                    ("updated_at", format_moment(self.clock.now())),
+                ],
+            )
+
+        with self.store.locks.guard(f"tank:{tank_id}"):
+            return self.tanks.update(tank_id, mutate)
+
+    def force_release(self, tank_id: str, batch_id: str) -> dict[str, Any]:
+        """批次中止时强制释放罐体；罐需重新清洗才能再用。"""
+
+        def mutate(document: dict[str, Any]) -> dict[str, Any]:
+            if document.get("batch_id") != batch_id:
+                raise ConflictError(
+                    "发酵罐不属于该批次，无法释放",
+                    tank_id=tank_id,
+                    tank_batch_id=document.get("batch_id"),
+                    batch_id=batch_id,
+                )
+            now = format_moment(self.clock.now())
+            return merge_documents(
+                document,
+                [
+                    ("stage", FermentStage.IDLE.value),
+                    ("batch_id", None),
+                    ("sanitized_at", None),
+                    ("cip_certificate_id", None),
+                    ("filled_at", None),
+                    ("pitched_at", None),
+                    ("fermenting_at", None),
+                    ("matured_at", None),
+                    ("updated_at", now),
+                ],
+            )
+
+        with self.store.locks.guard(f"tank:{tank_id}"):
+            return self.tanks.update(tank_id, mutate)
+
     def sanitize(self, tank_id: str, operator: str) -> dict[str, Any]:
         """清洗完成并拿到凭证后，把罐标记为可用。"""
 
@@ -82,7 +164,11 @@ class FermentTankService:
         certificate = self.cip.require_certificate(tank_id)
 
         def mutate(document: dict[str, Any]) -> dict[str, Any]:
-            if document.get("stage") not in (FermentStage.IDLE.value, FermentStage.SANITIZED.value):
+            if document.get("stage") not in (
+                FermentStage.IDLE.value,
+                FermentStage.CLEANING.value,
+                FermentStage.SANITIZED.value,
+            ):
                 raise ConflictError(
                     "发酵罐正在占用，无法重新清洗",
                     tank_id=tank_id,
@@ -274,6 +360,7 @@ class FermentTankService:
         """返回正在使用中的发酵罐。"""
 
         busy = {
+            FermentStage.CLEANING.value,
             FermentStage.FILLED.value,
             FermentStage.PITCHED.value,
             FermentStage.FERMENTING.value,

@@ -122,6 +122,16 @@ class HopSchedule:
         ]
         return sorted(items, key=lambda item: int(item.get("position", 0)))
 
+    def clear(self, batch_id: str) -> int:
+        """删除批次的全部酒花记录，用于开批失败回滚。"""
+
+        removed = 0
+        for item in self.list_for(batch_id):
+            key = self._key(batch_id, int(item["position"]))
+            if self.additions.delete(key):
+                removed += 1
+        return removed
+
     def pending(self, batch_id: str) -> list[dict[str, Any]]:
         """返回尚未投加的序次。"""
 

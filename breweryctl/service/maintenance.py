@@ -25,12 +25,22 @@ class MaintenanceService:
         self.audit = audit
 
     def start_clean(self, tank_id: str, operator: str) -> dict[str, Any]:
-        """为发酵罐启动一次清洗。"""
+        """为发酵罐启动一次清洗。
+
+        罐必须处于空闲（没有被批次占用）；启动时先把罐切入
+        清洗中状态，避免清洗期间被转罐占用。
+        """
 
         clean_operator = require_text(operator, field="operator", max_length=60)
         tank = self.tanks.get(tank_id)
-        circuit = self._circuit_for(str(tank["id"]), str(tank["brewery_id"]))
-        cycle = self.cip.start_cycle(str(circuit["id"]), str(tank["id"]), clean_operator)
+        previous_stage = str(tank.get("stage"))
+        self.tanks.begin_cleaning(str(tank["id"]))
+        try:
+            circuit = self._circuit_for(str(tank["id"]), str(tank["brewery_id"]))
+            cycle = self.cip.start_cycle(str(circuit["id"]), str(tank["id"]), clean_operator)
+        except Exception:
+            self.tanks.abort_cleaning(str(tank["id"]), previous_stage)
+            raise
         self.audit.record(
             str(tank["brewery_id"]),
             tank.get("batch_id"),

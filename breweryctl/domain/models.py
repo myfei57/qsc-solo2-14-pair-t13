@@ -38,6 +38,7 @@ class FermentStage(str, Enum):
     """发酵罐状态机。"""
 
     IDLE = "idle"
+    CLEANING = "cleaning"
     SANITIZED = "sanitized"
     FILLED = "filled"
     PITCHED = "pitched"
@@ -216,6 +217,23 @@ class BoilRun(DocMixin):
     boiling_at: str | None = None
     whirlpool_at: str | None = None
     completed_at: str | None = None
+    updated_at: str = ""
+
+
+@dataclass
+class BrewhouseVessel(DocMixin):
+    """糖化间容器（糖化锅、煮沸锅）的占用登记。
+
+    同一时刻一个容器只能服务一个批次；``batch_id`` 为占用者。
+    """
+
+    id: str
+    code: str
+    kind: str
+    brewery_id: str
+    line_id: str | None = None
+    batch_id: str | None = None
+    acquired_at: str | None = None
     updated_at: str = ""
 
 
