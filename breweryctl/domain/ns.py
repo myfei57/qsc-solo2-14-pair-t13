@@ -1,4 +1,4 @@
-"""酿造命名空间：工厂、产线与在制配额。"""
+"""酿造命名空间：工厂、产线、在制配额与热端容器位。"""
 
 from __future__ import annotations
 
@@ -74,6 +74,7 @@ class NamespaceRegistry:
             "name": clean_name,
             "capacity_hl": capacity,
             "vessel_count": vessels,
+            "active_batches": [],
             "created_at": now,
             "updated_at": now,
         }
@@ -137,6 +138,72 @@ class NamespaceRegistry:
             "batches": active,
         }
 
+    def reserve_vessel(
+        self,
+        brewery_id: str,
+        batch_id: str,
+        line_id: str | None = None,
+    ) -> dict[str, Any]:
+        """为批次占用一个热端容器位（糖化锅/煮沸锅），全部占用时拒绝。
+
+        容器位是全局互斥资源：一个批次从创建（进入热端）一直持有到
+        转出热端（转罐、中止或崩溃恢复），期间其他批次不能使用同一容器位。
+        """
+
+        clean_batch = require_text(batch_id, field="batch_id", max_length=64)
+        lines = self.lines_for(brewery_id)
+        if line_id is not None:
+            clean_line = require_text(line_id, field="line_id", max_length=64)
+            lines = [item for item in lines if item.get("id") == clean_line]
+            if not lines:
+                raise NotFoundError("产线不存在", brewery_id=brewery_id, line_id=clean_line)
+        if not lines:
+            raise NotFoundError("工厂没有可用产线", brewery_id=brewery_id)
+        for line in lines:
+            if self._try_reserve_vessel(str(line["id"]), clean_batch):
+                return self.lines.require(str(line["id"]), label="产线")
+        raise QuotaExceededError(
+            "糖化线热端容器位已满，无法并行新批次",
+            brewery_id=brewery_id,
+            lines=self.vessel_usage(brewery_id)["lines"],
+        )
+
+    def release_vessel(self, brewery_id: str, batch_id: str) -> None:
+        """释放批次占用的热端容器位；幂等，未占用时不报错。"""
+
+        clean_batch = require_text(batch_id, field="batch_id", max_length=64)
+        for line in self.lines_for(brewery_id):
+
+            def mutate(document: dict[str, Any]) -> dict[str, Any]:
+                active = [
+                    item for item in document.get("active_batches", []) if item != clean_batch
+                ]
+                if len(active) != len(document.get("active_batches", [])):
+                    document["active_batches"] = active
+                    document["updated_at"] = format_moment(self.clock.now())
+                return document
+
+            self.lines.update(str(line["id"]), mutate)
+
+    def vessel_usage(self, brewery_id: str) -> dict[str, Any]:
+        """返回每条产线的热端容器位占用情况。"""
+
+        lines: list[dict[str, Any]] = []
+        for line in self.lines_for(brewery_id):
+            active = list(line.get("active_batches", []))
+            capacity = int(line.get("vessel_count", 1))
+            lines.append(
+                {
+                    "line_id": line["id"],
+                    "name": line.get("name"),
+                    "capacity": capacity,
+                    "active": len(active),
+                    "available": max(capacity - len(active), 0),
+                    "batches": active,
+                }
+            )
+        return {"brewery_id": brewery_id, "lines": lines}
+
     def describe(self) -> dict[str, Any]:
         """汇总命名空间概况。"""
 
@@ -146,6 +213,9 @@ class NamespaceRegistry:
             "lines": self.lines.count(),
             "quota": {
                 item["id"]: self.usage(item["id"])["active"] for item in breweries
+            },
+            "vessels": {
+                item["id"]: self.vessel_usage(item["id"])["lines"] for item in breweries
             },
         }
 
@@ -158,3 +228,26 @@ class NamespaceRegistry:
         brewery = self.register_brewery("示范酿造厂", "demo", "上海")
         self.add_line(brewery["id"], "一号糖化线", 120.0, 2)
         return brewery
+
+    def _try_reserve_vessel(self, line_id: str, batch_id: str) -> bool:
+        """在单条产线上尝试占用容器位，成功返回 ``True``。"""
+
+        acquired = False
+
+        def mutate(document: dict[str, Any]) -> dict[str, Any]:
+            nonlocal acquired
+            active = list(document.get("active_batches", []))
+            if batch_id in active:
+                acquired = True
+                return document
+            capacity = int(document.get("vessel_count", 1))
+            if len(active) >= capacity:
+                return document
+            active.append(batch_id)
+            document["active_batches"] = active
+            document["updated_at"] = format_moment(self.clock.now())
+            acquired = True
+            return document
+
+        self.lines.update(line_id, mutate)
+        return acquired

@@ -216,6 +216,11 @@ class MashController:
             raise NotFoundError("糖化运行不存在", batch_id=batch_id)
         return document
 
+    def discard(self, batch_id: str) -> bool:
+        """删除批次的糖化运行，仅用于创建批次失败时的回滚。"""
+
+        return self.runs.delete(batch_id)
+
     def active(self) -> list[dict[str, Any]]:
         """返回所有未结束的糖化运行。"""
 

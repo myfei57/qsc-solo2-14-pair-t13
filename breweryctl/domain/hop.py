@@ -127,6 +127,15 @@ class HopSchedule:
 
         return [item for item in self.list_for(batch_id) if item.get("status") == HopStatus.PENDING.value]
 
+    def clear(self, batch_id: str) -> int:
+        """删除批次的全部酒花记录，仅用于创建批次失败时的回滚。"""
+
+        removed = 0
+        for item in self.list_for(batch_id):
+            if self.additions.delete(self._key(batch_id, int(item["position"]))):
+                removed += 1
+        return removed
+
     def next_position(self, batch_id: str) -> int | None:
         """返回下一个应投加的序次。"""
 

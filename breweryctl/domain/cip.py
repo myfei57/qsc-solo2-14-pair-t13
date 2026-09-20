@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 from ..core.clock import Clock, format_moment, parse_moment
 from ..core.config import Settings
-from ..core.errors import MaintenanceRequiredError, NotFoundError, SequenceError, ValidationError
+from ..core.errors import ConflictError, MaintenanceRequiredError, NotFoundError, SequenceError, ValidationError
 from ..core.ids import circuit_code, new_id, slugify
 from ..core.validators import require_number, require_text
 from ..persistence.store import FileStore, merge_documents
@@ -67,34 +67,45 @@ class CIPService:
         return self.circuits.put(circuit.id, circuit.to_doc())
 
     def start_cycle(self, circuit_id: str, tank_id: str, operator: str) -> dict[str, Any]:
-        """在指定发酵罐上开始清洗。"""
+        """在指定发酵罐上开始清洗。
+
+        回路是全局互斥资源：同一回路同一时刻只允许一个未完成的清洗，
+        检查与创建在同一个回路锁内完成，避免并发启动互相穿透。
+        """
 
         circuit = self.circuits.require(circuit_id, label="CIP 回路")
         clean_tank = require_text(tank_id, field="tank_id", max_length=64)
         if clean_tank not in circuit.get("tanks", []):
             raise ValidationError("该发酵罐不属于这条 CIP 回路", tank_id=clean_tank, circuit_id=circuit_id)
-        active = [
-            item
-            for item in self.cycles.all()
-            if item.get("tank_id") == clean_tank and not item.get("finished_at")
-        ]
-        if active:
-            raise SequenceError("该发酵罐已有未完成的清洗", tank_id=clean_tank, cycle_id=active[0]["id"])
-        now = format_moment(self.clock.now())
-        cycle = CipCycle(
-            id=new_id("cip"),
-            circuit_id=circuit["id"],
-            tank_id=clean_tank,
-            stage=CipStage.PRERINSE.value,
-            completed_stages=[CipStage.PRERINSE.value],
-            started_at=now,
-            operator=require_text(operator, field="operator", max_length=60),
-            updated_at=now,
-        )
-        document = self.cycles.put(cycle.id, cycle.to_doc())
+        clean_operator = require_text(operator, field="operator", max_length=60)
+        with self.store.locks.guard(f"cip_circuit:{circuit['id']}"):
+            active = [item for item in self.cycles.all() if not item.get("finished_at")]
+            for item in active:
+                if item.get("circuit_id") == circuit["id"]:
+                    raise ConflictError(
+                        "CIP 回路正在被另一清洗过程占用",
+                        circuit_id=circuit["id"],
+                        cycle_id=item.get("id"),
+                        tank_id=item.get("tank_id"),
+                    )
+            for item in active:
+                if item.get("tank_id") == clean_tank:
+                    raise SequenceError("该发酵罐已有未完成的清洗", tank_id=clean_tank, cycle_id=item["id"])
+            now = format_moment(self.clock.now())
+            cycle = CipCycle(
+                id=new_id("cip"),
+                circuit_id=circuit["id"],
+                tank_id=clean_tank,
+                stage=CipStage.PRERINSE.value,
+                completed_stages=[CipStage.PRERINSE.value],
+                started_at=now,
+                operator=clean_operator,
+                updated_at=now,
+            )
+            document = self.cycles.put(cycle.id, cycle.to_doc())
         self.store.append_event(
             "cip.started",
-            {"cycle_id": cycle.id, "tank_id": clean_tank, "circuit_id": circuit["id"]},
+            {"cycle_id": document["id"], "tank_id": clean_tank, "circuit_id": circuit["id"]},
         )
         return document
 

@@ -50,6 +50,7 @@ def batch_summary(document: dict[str, Any]) -> dict[str, Any]:
         "recipe_id": document.get("recipe_id"),
         "recipe_version": document.get("recipe_version"),
         "volume_l": document.get("volume_l"),
+        "line_id": document.get("line_id"),
         "tank_id": document.get("tank_id"),
         "priority": document.get("priority"),
         "created_at": document.get("created_at"),

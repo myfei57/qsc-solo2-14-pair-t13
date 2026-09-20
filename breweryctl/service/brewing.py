@@ -69,85 +69,102 @@ class BrewingService:
         actor: str,
         priority: str = "normal",
         notes: str = "",
+        line_id: str | None = None,
     ) -> dict[str, Any]:
-        """按已发布配方开一个新批次。"""
+        """按已发布配方开一个新批次。
+
+        创建过程持有工厂级创建锁：批次号分配、在制配额、热端容器位
+        三者原子完成；任一步失败都会完整回滚，不留半成品状态。
+        """
 
         clean_actor = require_text(actor, field="actor", max_length=60)
         volume = require_number(volume_l, field="volume_l", minimum=10.0, maximum=100_000.0)
         clean_priority = require_choice(priority, field="priority", choices=("low", "normal", "high"))
         content = self.recipes.content_for_batch(recipe_id)
         brewery_id = str(content["brewery_id"])
-        sequence = self.batches.count() + 1
-        now = format_moment(self.clock.now())
-        batch_id = new_id("batch")
-        batch = Batch(
-            id=batch_id,
-            code=batch_code(sequence, str(content["style"])),
-            brewery_id=brewery_id,
-            recipe_id=recipe_id,
-            recipe_version=int(content["version"]),
-            volume_l=volume,
-            stage=BatchStage.MASHING.value,
-            priority=clean_priority,
-            notes=notes.strip() if isinstance(notes, str) else "",
-            created_at=now,
-            updated_at=now,
-        )
-        self.namespaces.reserve_slot(brewery_id, batch_id)
-        try:
-            self.batches.put(batch_id, batch.to_doc())
-            self.mash.start(batch_id, float(content["mash_steps"][0]["target_temp_c"]))
-            self.wort.start(batch_id)
-            self.hops.plan(batch_id, content["hop_schedule"])
-        except Exception:
-            self.namespaces.release_slot(brewery_id, batch_id)
-            self.batches.delete(batch_id)
-            raise
-        self.audit.record(
-            brewery_id,
-            batch_id,
-            clean_actor,
-            "batch.created",
-            {
-                "recipe_id": recipe_id,
-                "recipe_version": content["version"],
-                "volume_l": volume,
-                "code": batch.code,
-            },
-        )
+        with self.store.locks.guard(f"batchseq:{brewery_id}"):
+            sequence = self.batches.count() + 1
+            now = format_moment(self.clock.now())
+            batch_id = new_id("batch")
+            self.namespaces.reserve_slot(brewery_id, batch_id)
+            try:
+                line = self.namespaces.reserve_vessel(brewery_id, batch_id, line_id=line_id)
+                batch = Batch(
+                    id=batch_id,
+                    code=batch_code(sequence, str(content["style"])),
+                    brewery_id=brewery_id,
+                    recipe_id=recipe_id,
+                    recipe_version=int(content["version"]),
+                    volume_l=volume,
+                    stage=BatchStage.MASHING.value,
+                    line_id=str(line["id"]),
+                    priority=clean_priority,
+                    notes=notes.strip() if isinstance(notes, str) else "",
+                    created_at=now,
+                    updated_at=now,
+                )
+                self.batches.put(batch_id, batch.to_doc())
+                self.mash.start(batch_id, float(content["mash_steps"][0]["target_temp_c"]))
+                self.wort.start(batch_id)
+                self.hops.plan(batch_id, content["hop_schedule"])
+            except Exception:
+                self.hops.clear(batch_id)
+                self.wort.discard(batch_id)
+                self.mash.discard(batch_id)
+                self.batches.delete(batch_id)
+                self.namespaces.release_vessel(brewery_id, batch_id)
+                self.namespaces.release_slot(brewery_id, batch_id)
+                raise
+            self.audit.record(
+                brewery_id,
+                batch_id,
+                clean_actor,
+                "batch.created",
+                {
+                    "recipe_id": recipe_id,
+                    "recipe_version": content["version"],
+                    "volume_l": volume,
+                    "code": batch.code,
+                    "line_id": batch.line_id,
+                },
+            )
         return self.status(batch_id)
 
     def confirm_water(self, batch_id: str, temp_c: float, probe_id: str, actor: str) -> dict[str, Any]:
         """确认糖化投料水温。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.MASHING.value)
-        run = self.mash.confirm_water(batch_id, temp_c, probe_id)
-        self._audit(batch, actor, "mash.water_confirmed", {"temp_c": run.get("water_temp_c"), "probe_id": probe_id})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.MASHING.value)
+            run = self.mash.confirm_water(batch_id, temp_c, probe_id)
+            self._audit(batch, actor, "mash.water_confirmed", {"temp_c": run.get("water_temp_c"), "probe_id": probe_id})
         return self.status(batch_id)
 
     def charge_mash(self, batch_id: str, grain_kg: float, actor: str) -> dict[str, Any]:
         """投料。"""
 
-        batch = self._require_batch(batch_id)
-        run = self.mash.charge(batch_id, grain_kg)
-        self._audit(batch, actor, "mash.charged", {"grain_kg": run.get("grain_kg")})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            run = self.mash.charge(batch_id, grain_kg)
+            self._audit(batch, actor, "mash.charged", {"grain_kg": run.get("grain_kg")})
         return self.status(batch_id)
 
     def heat_mash(self, batch_id: str, setpoint_c: float, actor: str) -> dict[str, Any]:
         """开始升温到第一个保温温度。"""
 
-        batch = self._require_batch(batch_id)
-        run = self.mash.heat(batch_id, setpoint_c)
-        self._audit(batch, actor, "mash.heating", {"setpoint_c": run.get("setpoint_c")})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            run = self.mash.heat(batch_id, setpoint_c)
+            self._audit(batch, actor, "mash.heating", {"setpoint_c": run.get("setpoint_c")})
         return self.status(batch_id)
 
     def rest_mash(self, batch_id: str, actual_temp_c: float, actor: str) -> dict[str, Any]:
         """温度到位后进入保温。"""
 
-        batch = self._require_batch(batch_id)
-        run = self.mash.mark_resting(batch_id, actual_temp_c)
-        self._audit(batch, actor, "mash.resting", {"actual_temp_c": actual_temp_c})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            run = self.mash.mark_resting(batch_id, actual_temp_c)
+            self._audit(batch, actor, "mash.resting", {"actual_temp_c": actual_temp_c})
         return self.status(batch_id)
 
     def filter_mash(
@@ -158,189 +175,224 @@ class BrewingService:
         ph: float,
         actor: str,
     ) -> dict[str, Any]:
-        """过滤并转入煮沸。"""
+        """过滤并转入煮沸。
 
-        batch = self._require_batch(batch_id)
-        self.require_mash_active(batch_id)
-        content = self.recipes.content_for_batch(str(batch["recipe_id"]))
-        self.mash.mark_filtered(batch_id)
-        run = self.wort.record_gravity(batch_id, gravity_plato, volume_l)
-        run = self.wort.adjust_ph(batch_id, ph)
-        self.wort.transfer_to_boil(batch_id, float(content["og_target"]))
-        boil_minutes = float(content["boil_minutes"])
-        self.boil.start(batch_id, boil_minutes)
-        self._set_stage(batch, BatchStage.BOILING.value, boil_id=self.boil.get(batch_id)["id"])
-        self._audit(
-            batch,
-            actor,
-            "wort.transferred",
-            {
-                "gravity_plato": run.get("gravity_plato"),
-                "volume_l": run.get("run_off_l"),
-                "ph": run.get("ph"),
-            },
-        )
+        先完成全部参数与工艺校验，再按序落状态；校验失败不产生任何写入，
+        批次可以修正参数后重试。
+        """
+
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.MASHING.value)
+            self.require_mash_active(batch_id)
+            content = self.recipes.content_for_batch(str(batch["recipe_id"]))
+            og_target = float(content["og_target"])
+            boil_minutes = float(content["boil_minutes"])
+            gravity = require_number(gravity_plato, field="gravity_plato", minimum=1.0, maximum=30.0)
+            volume = require_number(volume_l, field="volume_l", minimum=1.0, maximum=20_000.0)
+            clean_ph = require_number(ph, field="ph", minimum=4.0, maximum=7.0)
+            require_number(boil_minutes, field="boil_minutes", minimum=15.0, maximum=240.0)
+            self.wort.check_gravity_window(gravity, og_target, batch_id=batch_id)
+            self.mash.mark_filtered(batch_id)
+            run = self.wort.record_gravity(batch_id, gravity, volume)
+            run = self.wort.adjust_ph(batch_id, clean_ph)
+            self.wort.transfer_to_boil(batch_id, og_target)
+            self.boil.start(batch_id, boil_minutes)
+            self._set_stage(batch, BatchStage.BOILING.value, boil_id=self.boil.get(batch_id)["id"])
+            self._audit(
+                batch,
+                actor,
+                "wort.transferred",
+                {
+                    "gravity_plato": run.get("gravity_plato"),
+                    "volume_l": run.get("run_off_l"),
+                    "ph": run.get("ph"),
+                },
+            )
         return self.status(batch_id)
 
     def ignite_boil(self, batch_id: str, actor: str) -> dict[str, Any]:
         """开启煮沸锅加热。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.BOILING.value)
-        self.boil.ignite(batch_id)
-        self._audit(batch, actor, "boil.ignited", {})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.BOILING.value)
+            self.boil.ignite(batch_id)
+            self._audit(batch, actor, "boil.ignited", {})
         return self.status(batch_id)
 
     def boil_rolling(self, batch_id: str, actor: str) -> dict[str, Any]:
         """确认麦汁沸腾。"""
 
-        batch = self._require_batch(batch_id)
-        self.boil.mark_boiling(batch_id)
-        self._audit(batch, actor, "boil.rolling", {})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self.boil.mark_boiling(batch_id)
+            self._audit(batch, actor, "boil.rolling", {})
         return self.status(batch_id)
 
     def add_hop(self, batch_id: str, position: int, minute: float, actor: str) -> dict[str, Any]:
         """在配方窗口内按序投加酒花。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.BOILING.value)
-        addition = self.hops.add(batch_id, position, minute, actor)
-        self._audit(
-            batch,
-            actor,
-            "hop.added",
-            {"position": position, "minute": minute, "name": addition.get("name")},
-        )
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.BOILING.value)
+            addition = self.hops.add(batch_id, position, minute, actor)
+            self._audit(
+                batch,
+                actor,
+                "hop.added",
+                {"position": position, "minute": minute, "name": addition.get("name")},
+            )
         return self.status(batch_id)
 
     def whirlpool(self, batch_id: str, minute: float, actor: str) -> dict[str, Any]:
         """停止煮沸并进入回旋沉淀，随后开始降温。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.BOILING.value)
-        missed = self.hops.mark_missed(batch_id, minute)
-        self.boil.mark_whirlpool(batch_id)
-        self.boil.complete(batch_id)
-        self.temp.start_cooling(batch_id, self.settings.pitch_temp_max_c)
-        self._set_stage(batch, BatchStage.COOLING.value)
-        for item in missed:
-            self.alarms.raise_alarm(
-                brewery_id=str(batch["brewery_id"]),
-                source=f"hop:{batch_id}",
-                severity="warning",
-                code="hop_window_missed",
-                message=f"酒花 {item.get('name')} 错过投放窗口",
-                context={"batch_id": batch_id, "position": item.get("position")},
-            )
-        self._audit(batch, actor, "boil.completed", {"missed_hops": len(missed)})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.BOILING.value)
+            missed = self.hops.mark_missed(batch_id, minute)
+            self.boil.mark_whirlpool(batch_id)
+            self.boil.complete(batch_id)
+            self.temp.start_cooling(batch_id, self.settings.pitch_temp_max_c)
+            self._set_stage(batch, BatchStage.COOLING.value)
+            for item in missed:
+                self.alarms.raise_alarm(
+                    brewery_id=str(batch["brewery_id"]),
+                    source=f"hop:{batch_id}",
+                    severity="warning",
+                    code="hop_window_missed",
+                    message=f"酒花 {item.get('name')} 错过投放窗口",
+                    context={"batch_id": batch_id, "position": item.get("position")},
+                )
+            self._audit(batch, actor, "boil.completed", {"missed_hops": len(missed)})
         return self.status(batch_id)
 
     def cool_down(self, batch_id: str, target_c: float, actor: str) -> dict[str, Any]:
         """调整降温目标。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.COOLING.value)
-        self.temp.start_cooling(batch_id, target_c)
-        self._audit(batch, actor, "temp.cooling", {"target_c": target_c})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.COOLING.value)
+            self.temp.start_cooling(batch_id, target_c)
+            self._audit(batch, actor, "temp.cooling", {"target_c": target_c})
         return self.status(batch_id)
 
     def mark_cooled(self, batch_id: str, value_c: float, actor: str) -> dict[str, Any]:
         """记录温度已经达到接种要求。"""
 
-        batch = self._require_batch(batch_id)
-        self.temp.mark_reached(batch_id, value_c)
-        self._audit(batch, actor, "temp.reached", {"value_c": value_c})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self.temp.mark_reached(batch_id, value_c)
+            self._audit(batch, actor, "temp.reached", {"value_c": value_c})
         return self.status(batch_id)
 
     def transfer_to_tank(self, batch_id: str, tank_id: str, actor: str) -> dict[str, Any]:
-        """把冷却后的麦汁转入已清洗的发酵罐。"""
+        """把冷却后的麦汁转入已清洗的发酵罐，并释放热端容器位。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.COOLING.value)
-        self.temp.require_pitch_temperature(batch_id)
-        tank = self.tanks.transfer(tank_id, batch_id, float(batch["volume_l"]))
-        self._set_stage(batch, BatchStage.COOLING.value, tank_id=tank_id, cip_certificate_id=tank.get("cip_certificate_id"))
-        self._audit(
-            batch,
-            actor,
-            "ferment.transferred",
-            {"tank_id": tank_id, "certificate_id": tank.get("cip_certificate_id")},
-        )
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.COOLING.value)
+            if batch.get("tank_id"):
+                raise ConflictError(
+                    "批次已绑定发酵罐，禁止重复转罐",
+                    batch_id=batch_id,
+                    tank_id=batch.get("tank_id"),
+                )
+            self.temp.require_pitch_temperature(batch_id)
+            tank = self.tanks.transfer(tank_id, batch_id, float(batch["volume_l"]))
+            self._set_stage(batch, BatchStage.COOLING.value, tank_id=tank_id, cip_certificate_id=tank.get("cip_certificate_id"))
+            self.namespaces.release_vessel(str(batch["brewery_id"]), batch_id)
+            self._audit(
+                batch,
+                actor,
+                "ferment.transferred",
+                {"tank_id": tank_id, "certificate_id": tank.get("cip_certificate_id")},
+            )
         return self.status(batch_id)
 
     def pitch_yeast(self, batch_id: str, tank_id: str, temp_c: float, volume_l: float, actor: str) -> dict[str, Any]:
-        """接种酵母并进入发酵。"""
+        """接种酵母并进入发酵；罐体必须与批次转罐绑定一致。"""
 
-        batch = self._require_batch(batch_id)
-        self.temp.require_pitch_temperature(batch_id)
-        tank = self.tanks.pitch(tank_id, temp_c, volume_l)
-        self.tanks.start_fermentation(tank_id)
-        self.co2.set_pressure(tank_id, min(0.2, self.settings.pressure_limit_bar * 0.5))
-        self._set_stage(batch, BatchStage.FERMENTING.value, tank_id=tank_id)
-        self._audit(
-            batch,
-            actor,
-            "ferment.pitched",
-            {"tank_id": tank_id, "temp_c": temp_c, "volume_l": volume_l},
-        )
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.COOLING.value)
+            bound_tank = self._require_tank_binding(batch, tank_id)
+            self.temp.require_pitch_temperature(batch_id)
+            tank = self.tanks.pitch(bound_tank, temp_c, volume_l)
+            self.tanks.start_fermentation(bound_tank)
+            self.co2.set_pressure(bound_tank, min(0.2, self.settings.pressure_limit_bar * 0.5))
+            self._set_stage(batch, BatchStage.FERMENTING.value, tank_id=bound_tank)
+            self._audit(
+                batch,
+                actor,
+                "ferment.pitched",
+                {"tank_id": bound_tank, "temp_c": temp_c, "volume_l": volume_l},
+            )
         return self.status(batch_id)
 
     def mature_batch(self, batch_id: str, tank_id: str, days: float, actor: str) -> dict[str, Any]:
-        """发酵结束进入成熟。"""
+        """发酵结束进入成熟；罐体必须与批次绑定一致。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.FERMENTING.value)
-        self.tanks.mature(tank_id, days)
-        self._set_stage(batch, BatchStage.MATURING.value, tank_id=tank_id)
-        self._audit(batch, actor, "ferment.matured", {"tank_id": tank_id, "days": days})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.FERMENTING.value)
+            bound_tank = self._require_tank_binding(batch, tank_id)
+            self.tanks.mature(bound_tank, days)
+            self._set_stage(batch, BatchStage.MATURING.value, tank_id=bound_tank)
+            self._audit(batch, actor, "ferment.matured", {"tank_id": bound_tank, "days": days})
         return self.status(batch_id)
 
     def complete_batch(self, batch_id: str, actor: str) -> dict[str, Any]:
         """完成成熟并释放配额。"""
 
-        batch = self._require_batch(batch_id)
-        self._require_stage(batch, BatchStage.MATURING.value)
-        now = format_moment(self.clock.now())
-        updated = merge_documents(
-            batch,
-            [
-                ("stage", BatchStage.COMPLETED.value),
-                ("completed_at", now),
-                ("updated_at", now),
-            ],
-        )
-        self.batches.put(batch_id, updated)
-        self.namespaces.release_slot(str(batch["brewery_id"]), batch_id)
-        self._audit(updated, actor, "batch.completed", {})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            self._require_stage(batch, BatchStage.MATURING.value)
+            now = format_moment(self.clock.now())
+            updated = merge_documents(
+                batch,
+                [
+                    ("stage", BatchStage.COMPLETED.value),
+                    ("completed_at", now),
+                    ("updated_at", now),
+                ],
+            )
+            self.batches.put(batch_id, updated)
+            self.namespaces.release_slot(str(batch["brewery_id"]), batch_id)
+            self.namespaces.release_vessel(str(batch["brewery_id"]), batch_id)
+            self._audit(updated, actor, "batch.completed", {})
         return self.status(batch_id)
 
     def abort_batch(self, batch_id: str, reason: str, actor: str) -> dict[str, Any]:
-        """中止批次并释放命名空间配额。"""
+        """中止批次并释放命名空间配额与热端容器位。"""
 
-        batch = self._require_batch(batch_id)
-        if batch.get("stage") in (BatchStage.COMPLETED.value, BatchStage.ABORTED.value):
-            raise ConflictError("批次已经结束", batch_id=batch_id, stage=batch.get("stage"))
-        clean_reason = require_text(reason, field="reason", max_length=200)
-        now = format_moment(self.clock.now())
-        updated = merge_documents(
-            batch,
-            [
-                ("stage", BatchStage.ABORTED.value),
-                ("abort_reason", clean_reason),
-                ("updated_at", now),
-            ],
-        )
-        self.batches.put(batch_id, updated)
-        self.namespaces.release_slot(str(batch["brewery_id"]), batch_id)
-        self.alarms.raise_alarm(
-            brewery_id=str(batch["brewery_id"]),
-            source=f"batch:{batch_id}",
-            severity="warning",
-            code="batch_aborted",
-            message=f"批次 {batch.get('code')} 已中止：{clean_reason}",
-            context={"batch_id": batch_id, "reason": clean_reason},
-        )
-        self._audit(updated, actor, "batch.aborted", {"reason": clean_reason})
+        with self.store.locks.guard(f"batch:{batch_id}"):
+            batch = self._require_batch(batch_id)
+            if batch.get("stage") in (BatchStage.COMPLETED.value, BatchStage.ABORTED.value):
+                raise ConflictError("批次已经结束", batch_id=batch_id, stage=batch.get("stage"))
+            clean_reason = require_text(reason, field="reason", max_length=200)
+            now = format_moment(self.clock.now())
+            updated = merge_documents(
+                batch,
+                [
+                    ("stage", BatchStage.ABORTED.value),
+                    ("abort_reason", clean_reason),
+                    ("updated_at", now),
+                ],
+            )
+            self.batches.put(batch_id, updated)
+            self.namespaces.release_slot(str(batch["brewery_id"]), batch_id)
+            self.namespaces.release_vessel(str(batch["brewery_id"]), batch_id)
+            self.alarms.raise_alarm(
+                brewery_id=str(batch["brewery_id"]),
+                source=f"batch:{batch_id}",
+                severity="warning",
+                code="batch_aborted",
+                message=f"批次 {batch.get('code')} 已中止：{clean_reason}",
+                context={"batch_id": batch_id, "reason": clean_reason},
+            )
+            self._audit(updated, actor, "batch.aborted", {"reason": clean_reason})
         return self.status(batch_id)
 
     def status(self, batch_id: str) -> dict[str, Any]:
@@ -429,6 +481,7 @@ class BrewingService:
                 )
                 self.batches.put(str(batch["id"]), updated)
                 self.namespaces.release_slot(str(batch["brewery_id"]), str(batch["id"]))
+                self.namespaces.release_vessel(str(batch["brewery_id"]), str(batch["id"]))
                 repaired_batches.append(str(batch["id"]))
         return {"mash_runs": repaired, "batches": repaired_batches}
 
@@ -437,6 +490,21 @@ class BrewingService:
         if document is None:
             raise NotFoundError("批次不存在", batch_id=batch_id)
         return document
+
+    def _require_tank_binding(self, batch: dict[str, Any], tank_id: str) -> str:
+        """校验操作目标罐就是批次转罐时绑定的罐，防止跨罐串扰。"""
+
+        bound = batch.get("tank_id")
+        if not bound:
+            raise SequenceError("批次尚未转入发酵罐", batch_id=batch.get("id"))
+        if str(tank_id) != str(bound):
+            raise ConflictError(
+                "罐体与批次绑定不一致，禁止跨罐操作",
+                batch_id=batch.get("id"),
+                bound_tank_id=bound,
+                tank_id=tank_id,
+            )
+        return str(bound)
 
     def _require_stage(self, batch: dict[str, Any], stage: str) -> None:
         if batch.get("stage") != stage:

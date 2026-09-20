@@ -388,6 +388,7 @@ class Batch(DocMixin):
     mash_id: str | None = None
     wort_id: str | None = None
     boil_id: str | None = None
+    line_id: str | None = None
     tank_id: str | None = None
     cip_certificate_id: str | None = None
     priority: str = "normal"

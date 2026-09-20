@@ -221,6 +221,7 @@ class ApiRouter:
             actor=body.get("actor"),
             priority=str(body.get("priority", "normal")),
             notes=str(body.get("notes", "")),
+            line_id=body.get("line_id") or None,
         )
         return view
 

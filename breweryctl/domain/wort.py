@@ -78,15 +78,7 @@ class WortSystem:
                 raise SequenceError("尚未记录麦汁浓度，禁止转入煮沸", batch_id=batch_id)
             if document.get("transferred_at"):
                 raise SequenceError("麦汁已经转入煮沸锅", batch_id=batch_id)
-            low = (target - 1.0) * 100.0 - 1.5
-            high = (target - 1.0) * 100.0 + 1.5
-            if not low <= gravity <= high:
-                raise ValidationError(
-                    "麦汁浓度偏离配方目标",
-                    batch_id=batch_id,
-                    gravity_plato=gravity,
-                    expected_range=[round(low, 2), round(high, 2)],
-                )
+            self.check_gravity_window(gravity, target, batch_id=batch_id)
             now = format_moment(self.clock.now())
             return merge_documents(
                 document,
@@ -95,6 +87,26 @@ class WortSystem:
 
         with self.store.locks.guard(f"wort:{batch_id}"):
             return self.runs.update(batch_id, mutate)
+
+    def check_gravity_window(self, gravity_plato: float, og_target: float, batch_id: str | None = None) -> None:
+        """纯校验：麦汁浓度必须落在配方目标附近，不读写任何状态。"""
+
+        gravity = require_number(gravity_plato, field="gravity_plato", minimum=1.0, maximum=30.0)
+        target = require_number(og_target, field="og_target", minimum=0.9, maximum=1.3)
+        low = (target - 1.0) * 100.0 - 1.5
+        high = (target - 1.0) * 100.0 + 1.5
+        if not low <= gravity <= high:
+            raise ValidationError(
+                "麦汁浓度偏离配方目标",
+                batch_id=batch_id,
+                gravity_plato=gravity,
+                expected_range=[round(low, 2), round(high, 2)],
+            )
+
+    def discard(self, batch_id: str) -> bool:
+        """删除批次的麦汁记录，仅用于创建批次失败时的回滚。"""
+
+        return self.runs.delete(batch_id)
 
     def get(self, batch_id: str) -> dict[str, Any]:
         """读取麦汁记录。"""
